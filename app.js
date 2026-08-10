@@ -253,23 +253,136 @@ function normalizeStealthNovelAI(text){
   return null;
 }
 
+
+function findBytes(haystack, needle, from=0){
+  outer: for(let i=from;i<=haystack.length-needle.length;i++){
+    for(let j=0;j<needle.length;j++)if(haystack[i+j]!==needle[j])continue outer;
+    return i;
+  }
+  return -1;
+}
+function firstBalancedJsonObject(text){
+  const start=text.indexOf('{');
+  if(start<0)return '';
+  let depth=0,inString=false,escapeNext=false;
+  for(let i=start;i<text.length;i++){
+    const c=text[i];
+    if(inString){
+      if(escapeNext){escapeNext=false;continue}
+      if(c==='\\'){escapeNext=true;continue}
+      if(c==='"')inString=false;
+      continue;
+    }
+    if(c==='"'){inString=true;continue}
+    if(c==='{')depth++;
+    else if(c==='}'){
+      depth--;
+      if(depth===0)return text.slice(start,i+1);
+    }
+  }
+  return '';
+}
+async function readJpegNovelAIRaw(file){
+  const isJpeg=file&&(file.type==='image/jpeg'||/\.(jpe?g)$/i.test(file.name||''));
+  if(!isJpeg)return null;
+  const b=new Uint8Array(await file.arrayBuffer());
+  const enc=new TextEncoder();
+  const markers=[
+    enc.encode('{"Comment":"'),
+    enc.encode('{"Description":"'),
+    enc.encode('"Software":"NovelAI"')
+  ];
+  let start=-1;
+  for(const m of markers){
+    const p=findBytes(b,m);
+    if(p>=0){start=p;break}
+  }
+  if(start<0)return null;
+
+  // The full NovelAI payload can be fairly large; decode up to 4 MB from the marker.
+  const end=Math.min(b.length,start+4*1024*1024);
+  let text=new TextDecoder('utf-8',{fatal:false}).decode(b.subarray(start,end));
+
+  // If we found Software inside the object instead of its opening brace, rewind in decoded text is impossible.
+  // In that rare case use a wider byte window before the marker.
+  if(!text.startsWith('{')){
+    const back=Math.max(0,start-1024*1024);
+    text=new TextDecoder('utf-8',{fatal:false}).decode(b.subarray(back,end));
+    const c=text.lastIndexOf('{"Comment":"', start-back);
+    if(c>=0)text=text.slice(c);
+  }
+
+  const rawJson=firstBalancedJsonObject(text);
+  if(!rawJson)return null;
+  try{return JSON.parse(rawJson)}catch(e){
+    console.warn('NovelAI JPEG embedded JSON parse failed',e);
+    return null;
+  }
+}
+function normalizeNovelAIEnvelope(env){
+  if(!env||typeof env!=='object')return null;
+  let comment={};
+  if(typeof env.Comment==='string')comment=tryJson(env.Comment)||{};
+  else if(env.Comment&&typeof env.Comment==='object')comment=env.Comment;
+
+  const prompt =
+    pick(comment,['prompt','description','input']) ||
+    env.Description || env.description || '';
+
+  const negative =
+    pick(comment,['uc','negative_prompt','negativePrompt','undesired_content']) ||
+    env.NegativePrompt || '';
+
+  const meta={
+    prompt:String(prompt||''),
+    negative:String(negative||''),
+    seed:pick(comment,['seed']),
+    steps:pick(comment,['steps']),
+    scale:pick(comment,['scale','cfg_scale','prompt_guidance']),
+    sampler:pick(comment,['sampler']),
+    model:pick(comment,['model','model_name']) || env.Source || env.source || '',
+    software:env.Software||env.software||'',
+    source:env.Source||env.source||'',
+    raw:comment,
+    envelope:env
+  };
+
+  const looksNovel=/novelai/i.test(
+    `${meta.software} ${meta.source} ${env.Title||''} ${JSON.stringify(comment).slice(0,5000)}`
+  );
+
+  return (looksNovel||meta.prompt||meta.negative||meta.seed)?meta:null;
+}
+
 async function extractNovelAIMetadata(file){
   try{
     const name=(file?.name||'').toLowerCase();
+
     if(file?.type==='image/png'||name.endsWith('.png')){
       const normal=normalizeNovelAIMetadata(await readPngTextChunks(file));
       if(normal)return normal;
       const stealth=await readStealthMetadata(file);
       return normalizeStealthNovelAI(stealth);
     }
+
     if(file?.type==='image/jpeg'||/\.(jpe?g)$/i.test(name)){
+      // 1) NovelAI/Apple Photos JPEGs can preserve the complete NovelAI JSON block verbatim.
+      const embedded=normalizeNovelAIEnvelope(await readJpegNovelAIRaw(file));
+      if(embedded)return embedded;
+
+      // 2) Fallback to ordinary EXIF fields.
       const exif=normalizeNovelAIMetadata(await readJpegExif(file));
       if(exif)return exif;
-      /* Some browsers/files may carry a decodable lossless source despite an odd extension. */
+
+      // 3) Last fallback for lossless/oddly-labelled image files.
       try{return normalizeStealthNovelAI(await readStealthMetadata(file))}catch{return null}
     }
+
     return null;
-  }catch(e){console.warn('NovelAI metadata extract failed',e);return null}
+  }catch(e){
+    console.warn('NovelAI metadata extract failed',e);
+    return null;
+  }
 }
 function renderNovelAIMeta(meta){workingMetadata=meta||null;const box=$('#naiMetaBox');if(!box)return;if(!meta){box.classList.add('hidden');['entrySeed','entrySteps','entryScale','entrySampler','entryModel'].forEach(id=>{const el=$('#'+id);if(el)el.value=''});return}box.classList.remove('hidden');$('#entrySeed').value=meta.seed??'';$('#entrySteps').value=meta.steps??'';$('#entryScale').value=meta.scale??'';$('#entrySampler').value=meta.sampler??'';$('#entryModel').value=meta.model??'';$('#naiMetaStatus').textContent=/novelai/i.test((meta.software||'')+' '+(meta.source||'')+' '+JSON.stringify(meta.raw||{}))?'NovelAI 메타데이터 감지됨':'이미지 메타데이터 감지됨'}
 
