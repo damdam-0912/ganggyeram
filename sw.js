@@ -1,13 +1,13 @@
-const CACHE='ganggyeram-v7-nai-jpeg';
+const CACHE='ganggyeram-v8-nai-jpeg-xmp';
 const ASSETS=[
   './',
   './index.html',
-  './styles.css?v=7',
-  './app.js?v=7',
-  './manifest.webmanifest?v=7',
-  './icons/icon-192.png?v=7',
-  './icons/icon-512.png?v=7',
-  './icons/icon-180.png?v=7'
+  './styles.css?v=8',
+  './app.js?v=8',
+  './manifest.webmanifest?v=8',
+  './icons/icon-192.png?v=8',
+  './icons/icon-512.png?v=8',
+  './icons/icon-180.png?v=8'
 ];
 self.addEventListener('install',e=>e.waitUntil(
   caches.open(CACHE).then(c=>c.addAll(ASSETS)).then(()=>self.skipWaiting())

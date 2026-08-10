@@ -354,6 +354,80 @@ function normalizeNovelAIEnvelope(env){
   return (looksNovel||meta.prompt||meta.negative||meta.seed)?meta:null;
 }
 
+
+async function readJpegWithExifr(file){
+  if(typeof exifr==='undefined')return null;
+  try{
+    const data=await exifr.parse(file,{
+      tiff:true,exif:true,xmp:true,iptc:true,jfif:true,
+      icc:false,ihdr:false,translateKeys:true,
+      translateValues:false,reviveValues:false
+    });
+    if(!data)return null;
+
+    const candidates=[
+      data.Comment,data.comment,data.UserComment,
+      data.ImageDescription,data.Description,data.description,
+      data.parameters,data.Parameters
+    ].filter(v=>v!=null);
+
+    let comment={};
+    for(const value of candidates){
+      if(value&&typeof value==='object'){comment=value;break}
+      if(typeof value==='string'){
+        const parsed=tryJson(value);
+        if(parsed&&typeof parsed==='object'){comment=parsed;break}
+        const first=value.indexOf('{'),last=value.lastIndexOf('}');
+        if(first>=0&&last>first){
+          const embedded=tryJson(value.slice(first,last+1));
+          if(embedded&&typeof embedded==='object'){comment=embedded;break}
+        }
+      }
+    }
+
+    if(!Object.keys(comment).length)comment=data;
+
+    const software=data.Software||data.software||comment.Software||'';
+    const source=data.Source||data.source||comment.Source||'';
+    const description=
+      data.ImageDescription||data.Description||data.description||
+      comment.Description||comment.description||'';
+
+    let prompt=pick(comment,['prompt','description','input']);
+    if(!prompt && typeof description==='string' &&
+       !/^NovelAI generated image$/i.test(description.trim())){
+      prompt=description;
+    }
+
+    const negative=pick(comment,[
+      'uc','negative_prompt','negativePrompt','undesired_content'
+    ]);
+
+    const meta={
+      prompt:String(prompt||''),
+      negative:String(negative||''),
+      seed:pick(comment,['seed']),
+      steps:pick(comment,['steps']),
+      scale:pick(comment,['scale','cfg_scale','prompt_guidance']),
+      sampler:pick(comment,['sampler']),
+      model:pick(comment,['model','model_name'])||source,
+      software,source,raw:comment,exifr:data
+    };
+
+    const rawText=JSON.stringify(data);
+    const looksNovel=/novelai/i.test(`${software} ${source} ${rawText}`) ||
+      Object.keys(comment).some(k=>[
+        'uc','sampler','noise_schedule','sm','sm_dyn',
+        'dynamic_thresholding','char_captions'
+      ].includes(k));
+
+    return (looksNovel||meta.prompt||meta.negative||meta.seed)?meta:null;
+  }catch(e){
+    console.warn('exifr JPEG metadata parse failed',e);
+    return null;
+  }
+}
+
 async function extractNovelAIMetadata(file){
   try{
     const name=(file?.name||'').toLowerCase();
@@ -366,15 +440,19 @@ async function extractNovelAIMetadata(file){
     }
 
     if(file?.type==='image/jpeg'||/\.(jpe?g)$/i.test(name)){
-      // 1) NovelAI/Apple Photos JPEGs can preserve the complete NovelAI JSON block verbatim.
+      // 1) Complete NovelAI JSON preserved inside JPEG bytes.
       const embedded=normalizeNovelAIEnvelope(await readJpegNovelAIRaw(file));
       if(embedded)return embedded;
 
-      // 2) Fallback to ordinary EXIF fields.
+      // 2) EXIF/XMP/IPTC parser (ImageDescription, UserComment, XMP etc.).
+      const rich=await readJpegWithExifr(file);
+      if(rich)return rich;
+
+      // 3) Lightweight built-in EXIF parser.
       const exif=normalizeNovelAIMetadata(await readJpegExif(file));
       if(exif)return exif;
 
-      // 3) Last fallback for lossless/oddly-labelled image files.
+      // 4) Last fallback for lossless/oddly-labelled image files.
       try{return normalizeStealthNovelAI(await readStealthMetadata(file))}catch{return null}
     }
 
