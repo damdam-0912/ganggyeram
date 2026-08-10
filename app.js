@@ -25,11 +25,136 @@ function bytesToLatin1(bytes){let s='';const step=0x8000;for(let i=0;i<bytes.len
 function bytesToUtf8(bytes){try{return new TextDecoder('utf-8').decode(bytes)}catch{return bytesToLatin1(bytes)}}
 async function inflateBytes(bytes){if(typeof DecompressionStream==='undefined')return null;try{const ds=new DecompressionStream('deflate');const ab=await new Response(new Blob([bytes]).stream().pipeThrough(ds)).arrayBuffer();return new Uint8Array(ab)}catch{return null}}
 async function readPngTextChunks(file){if(!file||file.type!=='image/png'&&!file.name?.toLowerCase().endsWith('.png'))return {};const b=new Uint8Array(await file.arrayBuffer());if(b.length<8||b[0]!==137||b[1]!==80||b[2]!==78||b[3]!==71)return {};const out={};let pos=8;while(pos+12<=b.length){const len=((b[pos]<<24)|(b[pos+1]<<16)|(b[pos+2]<<8)|b[pos+3])>>>0;const type=String.fromCharCode(...b.subarray(pos+4,pos+8));const data=b.subarray(pos+8,pos+8+len);pos+=12+len;if(type==='IEND')break;try{if(type==='tEXt'){const z=data.indexOf(0);if(z>0)out[bytesToLatin1(data.subarray(0,z))]=bytesToLatin1(data.subarray(z+1))}else if(type==='zTXt'){const z=data.indexOf(0);if(z>0){const dec=await inflateBytes(data.subarray(z+2));if(dec)out[bytesToLatin1(data.subarray(0,z))]=bytesToLatin1(dec)}}else if(type==='iTXt'){let i=0;while(i<data.length&&data[i]!==0)i++;const key=bytesToLatin1(data.subarray(0,i));i++;const compressed=data[i++]===1;i++;while(i<data.length&&data[i]!==0)i++;i++;while(i<data.length&&data[i]!==0)i++;i++;let val=data.subarray(i);if(compressed){const dec=await inflateBytes(val);if(dec)val=dec}out[key]=bytesToUtf8(val)}}catch(e){console.warn('PNG metadata chunk parse failed',type,e)}}return out}
+
+/* JPEG EXIF parser for NovelAI metadata */
+function trimNulls(s=''){return String(s).replace(/\0+$/g,'').trim()}
+function decodeUserComment(bytes){
+  if(!bytes||!bytes.length)return '';
+  const head=bytesToLatin1(bytes.subarray(0,Math.min(8,bytes.length)));
+  let body=bytes;
+  if(/^ASCII/.test(head))body=bytes.subarray(8);
+  else if(/^UNICODE/.test(head)){
+    body=bytes.subarray(8);
+    try{
+      if(body.length>=2){
+        const be=body[0]===0&&body[1]!==0;
+        const dv=new DataView(body.buffer,body.byteOffset,body.byteLength);
+        let s=''; for(let i=0;i+1<body.length;i+=2)s+=String.fromCharCode(dv.getUint16(i,!be));
+        return trimNulls(s);
+      }
+    }catch{}
+  }
+  const u8=bytesToUtf8(body);
+  if(u8 && !u8.includes('\uFFFD'))return trimNulls(u8);
+  return trimNulls(bytesToLatin1(body));
+}
+function readTiffValue(dv,tiffStart,entryOff,little){
+  const type=dv.getUint16(entryOff+2,little), count=dv.getUint32(entryOff+4,little);
+  const sizes={1:1,2:1,3:2,4:4,5:8,7:1,9:4,10:8};
+  const size=(sizes[type]||1)*count;
+  let dataOff=size<=4?entryOff+8:tiffStart+dv.getUint32(entryOff+8,little);
+  if(dataOff<0||dataOff+size>dv.byteLength)return null;
+  const bytes=new Uint8Array(dv.buffer,dv.byteOffset+dataOff,size);
+  if(type===2)return trimNulls(bytesToLatin1(bytes));
+  if(type===7)return bytes;
+  if(type===3&&count===1)return dv.getUint16(dataOff,little);
+  if(type===4&&count===1)return dv.getUint32(dataOff,little);
+  return bytes;
+}
+function parseExifIFD(dv,tiffStart,ifdRel,little,out,depth=0){
+  if(depth>3)return;
+  const ifd=tiffStart+ifdRel;
+  if(ifd<0||ifd+2>dv.byteLength)return;
+  const n=dv.getUint16(ifd,little);
+  for(let i=0;i<n;i++){
+    const off=ifd+2+i*12; if(off+12>dv.byteLength)break;
+    const tag=dv.getUint16(off,little);
+    const val=readTiffValue(dv,tiffStart,off,little);
+    if(tag===0x010E && typeof val==='string')out.ImageDescription=val;
+    else if(tag===0x0131 && typeof val==='string')out.Software=val;
+    else if(tag===0x9286 && val instanceof Uint8Array)out.UserComment=decodeUserComment(val);
+    else if(tag===0x8769 && typeof val==='number')parseExifIFD(dv,tiffStart,val,little,out,depth+1);
+  }
+}
+async function readJpegExif(file){
+  const isJpeg=file&&(file.type==='image/jpeg'||/\.(jpe?g)$/i.test(file.name||''));
+  if(!isJpeg)return {};
+  const buf=await file.arrayBuffer(), b=new Uint8Array(buf), dv=new DataView(buf);
+  const out={};
+  if(b.length<4||b[0]!==0xFF||b[1]!==0xD8)return out;
+  let pos=2;
+  while(pos+4<=b.length){
+    if(b[pos]!==0xFF){pos++;continue}
+    const marker=b[pos+1];
+    if(marker===0xDA||marker===0xD9)break;
+    const len=dv.getUint16(pos+2,false);
+    if(len<2||pos+2+len>b.length)break;
+    if(marker===0xE1&&len>=8&&bytesToLatin1(b.subarray(pos+4,pos+10))==='Exif\0\0'){
+      const tiffStart=pos+10;
+      if(tiffStart+8<=b.length){
+        const endian=bytesToLatin1(b.subarray(tiffStart,tiffStart+2));
+        const little=endian==='II';
+        if(little||endian==='MM'){
+          try{
+            if(dv.getUint16(tiffStart+2,little)===42){
+              const ifd0=dv.getUint32(tiffStart+4,little);
+              parseExifIFD(dv,tiffStart,ifd0,little,out);
+            }
+          }catch(e){console.warn('EXIF parse failed',e)}
+        }
+      }
+    }
+    pos+=2+len;
+  }
+  /* fallback: some exported JPEGs contain readable NovelAI text outside parsed EXIF */
+  try{
+    const raw=bytesToLatin1(b);
+    if(!out.Software){
+      const m=raw.match(/NovelAI Diffusion[^\0\r\n]{0,120}/i);
+      if(m)out.Software=trimNulls(m[0]);
+    }
+  }catch{}
+  return out;
+}
 function tryJson(s){if(!s||typeof s!=='string')return null;try{return JSON.parse(s)}catch{return null}}
 function pick(obj,keys){for(const k of keys){if(obj&&obj[k]!=null&&obj[k]!=='' )return obj[k]}return ''}
-function normalizeNovelAIMetadata(chunks){const comment=tryJson(chunks.Comment)||tryJson(chunks.comment)||{};const desc=chunks.Description||chunks.description||'';const software=chunks.Software||chunks.software||'';const source=chunks.Source||chunks.source||'';const prompt=pick(comment,['prompt','description','input'])||desc;const negative=pick(comment,['uc','negative_prompt','negativePrompt','undesired_content']);const meta={prompt:String(prompt||''),negative:String(negative||''),seed:pick(comment,['seed']),steps:pick(comment,['steps']),scale:pick(comment,['scale','cfg_scale','prompt_guidance']),sampler:pick(comment,['sampler']),model:pick(comment,['model','model_name'])||source,software,source,raw:comment};const looksNovel=/novelai/i.test(software+' '+source)||Object.keys(comment).some(k=>['uc','sampler','noise_schedule','sm','sm_dyn','dynamic_thresholding'].includes(k));return (looksNovel||meta.prompt||meta.seed)?meta:null}
-async function extractNovelAIMetadata(file){try{return normalizeNovelAIMetadata(await readPngTextChunks(file))}catch(e){console.warn(e);return null}}
-function renderNovelAIMeta(meta){workingMetadata=meta||null;const box=$('#naiMetaBox');if(!box)return;if(!meta){box.classList.add('hidden');['entrySeed','entrySteps','entryScale','entrySampler','entryModel'].forEach(id=>{const el=$('#'+id);if(el)el.value=''});return}box.classList.remove('hidden');$('#entrySeed').value=meta.seed??'';$('#entrySteps').value=meta.steps??'';$('#entryScale').value=meta.scale??'';$('#entrySampler').value=meta.sampler??'';$('#entryModel').value=meta.model??'';$('#naiMetaStatus').textContent=/novelai/i.test((meta.software||'')+' '+(meta.source||''))?'NovelAI 메타데이터 감지됨':'PNG 메타데이터 감지됨'}
+function parseNovelAIText(text){
+  if(!text||typeof text!=='string')return {};
+  const direct=tryJson(text);
+  if(direct&&typeof direct==='object')return direct;
+  /* find a JSON object embedded after "NovelAI generated image" or similar */
+  const first=text.indexOf('{'), last=text.lastIndexOf('}');
+  if(first>=0&&last>first){
+    const embedded=tryJson(text.slice(first,last+1));
+    if(embedded&&typeof embedded==='object')return embedded;
+  }
+  return {prompt:text};
+}
+function normalizeNovelAIMetadata(chunks){
+  const commentText=chunks.Comment||chunks.comment||chunks.UserComment||'';
+  const descText=chunks.Description||chunks.description||chunks.ImageDescription||'';
+  const comment=parseNovelAIText(commentText);
+  const descObj=parseNovelAIText(descText);
+  const software=chunks.Software||chunks.software||'';
+  const source=chunks.Source||chunks.source||'';
+  let prompt=pick(comment,['prompt','description','input'])||pick(descObj,['prompt','description','input']);
+  let negative=pick(comment,['uc','negative_prompt','negativePrompt','undesired_content'])||pick(descObj,['uc','negative_prompt','negativePrompt','undesired_content']);
+  /* If ImageDescription is plain NovelAI text, don't use the generic marker itself as the prompt. */
+  if(!prompt && descText && !/^NovelAI generated image$/i.test(descText.trim()))prompt=descText;
+  const merged={...descObj,...comment};
+  const meta={prompt:String(prompt||''),negative:String(negative||''),seed:pick(merged,['seed']),steps:pick(merged,['steps']),scale:pick(merged,['scale','cfg_scale','prompt_guidance']),sampler:pick(merged,['sampler']),model:pick(merged,['model','model_name'])||source,software,source,raw:merged};
+  const looksNovel=/novelai/i.test(software+' '+source+' '+descText)||Object.keys(merged).some(k=>['uc','sampler','noise_schedule','sm','sm_dyn','dynamic_thresholding'].includes(k));
+  return (looksNovel||meta.prompt||meta.seed)?meta:null
+}
+async function extractNovelAIMetadata(file){
+  try{
+    const name=(file?.name||'').toLowerCase();
+    if(file?.type==='image/png'||name.endsWith('.png'))return normalizeNovelAIMetadata(await readPngTextChunks(file));
+    if(file?.type==='image/jpeg'||/\.(jpe?g)$/i.test(name))return normalizeNovelAIMetadata(await readJpegExif(file));
+    return null;
+  }catch(e){console.warn('NovelAI metadata extract failed',e);return null}
+}
+function renderNovelAIMeta(meta){workingMetadata=meta||null;const box=$('#naiMetaBox');if(!box)return;if(!meta){box.classList.add('hidden');['entrySeed','entrySteps','entryScale','entrySampler','entryModel'].forEach(id=>{const el=$('#'+id);if(el)el.value=''});return}box.classList.remove('hidden');$('#entrySeed').value=meta.seed??'';$('#entrySteps').value=meta.steps??'';$('#entryScale').value=meta.scale??'';$('#entrySampler').value=meta.sampler??'';$('#entryModel').value=meta.model??'';$('#naiMetaStatus').textContent=/novelai/i.test((meta.software||'')+' '+(meta.source||'')+' '+JSON.stringify(meta.raw||{}))?'NovelAI 메타데이터 감지됨':'이미지 메타데이터 감지됨'}
 
 async function submitEntry(ev){ev.preventDefault();const id=$('#entryId').value;const now=new Date().toISOString();const item={id:id||uid(),title:$('#entryTitle').value.trim(),type:$('#entryType').value,folderId:$('#entryFolder').value||null,prompt:$('#entryPrompt').value,negative:$('#entryNegative').value,tags:$('#entryTags').value.split(',').map(x=>x.trim()).filter(Boolean),images:workingImages,metadata:workingMetadata,favorite:$('#entryFavorite').checked,trashed:false,createdAt:now,updatedAt:now};if(id){const old=state.entries.find(x=>x.id===id);Object.assign(item,{createdAt:old.createdAt,trashed:old.trashed});state.entries[state.entries.findIndex(x=>x.id===id)]=item}else state.entries.push(item);await saveState();$('#entryDialog').close();renderAll()}
 function openFolderDialog(id=null){const f=id?state.folders.find(x=>x.id===id):null;$('#folderDialogTitle').textContent=f?'폴더 수정':'폴더 추가';$('#folderId').value=f?.id||'';$('#folderName').value=f?.name||'';renderFolderSelects();$('#folderParent').value=f?.parentId||'';if(id){[...$('#folderParent').options].forEach(o=>{if(o.value===id||descendantIds(id).has(o.value))o.disabled=true})}$('#folderDialog').showModal()}
