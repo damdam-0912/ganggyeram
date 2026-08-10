@@ -356,6 +356,43 @@ function normalizeNovelAIEnvelope(env){
 }
 
 
+
+async function readWebpExif(file){
+  const isWebp=file&&(file.type==='image/webp'||/\.webp$/i.test(file.name||''));
+  if(!isWebp)return {};
+  const buf=await file.arrayBuffer(), b=new Uint8Array(buf), dv=new DataView(buf);
+  const out={};
+  if(b.length<12||bytesToLatin1(b.subarray(0,4))!=='RIFF'||bytesToLatin1(b.subarray(8,12))!=='WEBP')return out;
+  let pos=12;
+  while(pos+8<=b.length){
+    const type=bytesToLatin1(b.subarray(pos,pos+4));
+    const len=dv.getUint32(pos+4,true);
+    const dataStart=pos+8, dataEnd=dataStart+len;
+    if(dataEnd>b.length)break;
+    if(type==='EXIF'){
+      let tiffStart=dataStart;
+      // WebP EXIF may start directly with TIFF (II/MM) or with Exif\\0\\0.
+      if(len>=6&&bytesToLatin1(b.subarray(dataStart,dataStart+6))==='Exif\\0\\0')tiffStart+=6;
+      if(tiffStart+8<=dataEnd){
+        const endian=bytesToLatin1(b.subarray(tiffStart,tiffStart+2));
+        const little=endian==='II';
+        if(little||endian==='MM'){
+          try{
+            if(dv.getUint16(tiffStart+2,little)===42){
+              const ifd0=dv.getUint32(tiffStart+4,little);
+              parseExifIFD(dv,tiffStart,ifd0,little,out);
+            }
+          }catch(e){console.warn('WEBP EXIF parse failed',e)}
+        }
+      }
+    }else if(type==='XMP '){
+      try{out.XMP=bytesToUtf8(b.subarray(dataStart,dataEnd))}catch{}
+    }
+    pos=dataEnd+(len&1);
+  }
+  return out;
+}
+
 async function readJpegWithExifr(file){
   if(typeof exifr==='undefined')return null;
   try{
@@ -457,6 +494,19 @@ async function extractNovelAIMetadata(file){
       try{return normalizeStealthNovelAI(await readStealthMetadata(file))}catch{return null}
     }
 
+    if(file?.type==='image/webp'||name.endsWith('.webp')){
+      // WebP stores EXIF/XMP as RIFF chunks. NovelAI exports may preserve the full JSON in UserComment.
+      const chunks=await readWebpExif(file);
+      if(chunks?.UserComment){
+        const envelope=tryJson(chunks.UserComment);
+        const wrapped=normalizeNovelAIEnvelope(envelope);
+        if(wrapped){wrapped.webp=true;return wrapped}
+      }
+      const normal=normalizeNovelAIMetadata(chunks);
+      if(normal){normal.webp=true;return normal}
+      return null;
+    }
+
     return null;
   }catch(e){
     console.warn('NovelAI metadata extract failed',e);
@@ -538,7 +588,7 @@ async function importBackup(file){try{const data=JSON.parse(await file.text());i
 async function seed(){const f1={id:uid(),name:'캐릭터',parentId:null},f2={id:uid(),name:'학교',parentId:f1.id};state.folders.push(f1,f2);state.entries.push({id:uid(),title:'봄 교실 미소',type:'NovelAI',folderId:f2.id,prompt:'boy, solo, male focus, black hair, short hair, school uniform, classroom, spring, gentle smile',negative:'low quality, bad hands',tags:['남캐','교복','봄'],images:[],favorite:true,trashed:false,createdAt:new Date().toISOString(),updatedAt:new Date().toISOString()});await saveState();renderAll();toast('예시 데이터를 추가했어요')}
 function closeDialogs(){/* no-op */}
 $$('.close-dialog').forEach(b=>b.onclick=()=>b.closest('dialog').close());
-$('#entryForm').addEventListener('submit',submitEntry);$('#folderForm').addEventListener('submit',submitFolder);$('#entryImages').addEventListener('change',async e=>{const files=[...e.target.files];workingImages.push(...await filesToDataUrls(files));renderImagePreview();for(const f of files){const meta=await extractNovelAIMetadata(f);if(!meta)continue;renderNovelAIMeta(meta);const split=splitPromptParts(meta.prompt||'');if(split.artist&&$('#entryArtistTags')&&!$('#entryArtistTags').value.trim())$('#entryArtistTags').value=split.artist;if(split.prompt&&!$('#entryPrompt').value.trim())$('#entryPrompt').value=split.prompt;const charPrompt=extractCharacterPrompt(meta.raw||meta.envelope||meta.exifr||{});if(charPrompt&&$('#entryCharacterPrompt')&&!$('#entryCharacterPrompt').value.trim())$('#entryCharacterPrompt').value=charPrompt;if(meta.negative&&!$('#entryNegative').value.trim())$('#entryNegative').value=meta.negative;if(!$('#entryTitle').value.trim())$('#entryTitle').value=(f.name||'NovelAI 이미지').replace(/\.[^.]+$/,'');$('#entryType').value='NovelAI';toast(meta.stealth?'NovelAI Stealth 메타데이터를 불러왔어요':'NovelAI 메타데이터를 자동 분류했어요');break}});
+$('#entryForm').addEventListener('submit',submitEntry);$('#folderForm').addEventListener('submit',submitFolder);$('#entryImages').addEventListener('change',async e=>{const files=[...e.target.files];workingImages.push(...await filesToDataUrls(files));renderImagePreview();for(const f of files){const meta=await extractNovelAIMetadata(f);if(!meta)continue;renderNovelAIMeta(meta);const split=splitPromptParts(meta.prompt||'');if(split.artist&&$('#entryArtistTags')&&!$('#entryArtistTags').value.trim())$('#entryArtistTags').value=split.artist;if(split.prompt&&!$('#entryPrompt').value.trim())$('#entryPrompt').value=split.prompt;const charPrompt=extractCharacterPrompt(meta.raw||meta.envelope||meta.exifr||{});if(charPrompt&&$('#entryCharacterPrompt')&&!$('#entryCharacterPrompt').value.trim())$('#entryCharacterPrompt').value=charPrompt;if(meta.negative&&!$('#entryNegative').value.trim())$('#entryNegative').value=meta.negative;if(!$('#entryTitle').value.trim())$('#entryTitle').value=(f.name||'NovelAI 이미지').replace(/\.[^.]+$/,'');$('#entryType').value='NovelAI';toast(meta.webp?'NovelAI WEBP 메타데이터를 불러왔어요':(meta.stealth?'NovelAI Stealth 메타데이터를 불러왔어요':'NovelAI 메타데이터를 자동 분류했어요'));break}});
 if($('#addEntryBtn'))$('#addEntryBtn').onclick=()=>openEntryDialog();if($('#fab'))$('#fab').onclick=()=>openEntryDialog();if($('#addFolderBtn'))$('#addFolderBtn').onclick=()=>openFolderDialog();
 $('#searchInput').oninput=e=>{view.query=e.target.value;renderEntries()};$('#clearSearchBtn').onclick=()=>{$('#searchInput').value='';view.query='';renderEntries()};
 $$('#filterTabs .chip').forEach(b=>b.onclick=()=>{$$('#filterTabs .chip').forEach(x=>x.classList.remove('active'));b.classList.add('active');view.filter=b.dataset.filter;renderTags();renderEntries()});

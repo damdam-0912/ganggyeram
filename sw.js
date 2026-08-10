@@ -1,8 +1,8 @@
-const CACHE='ganggyeram-v10-button-cache-fix';
+const CACHE='ganggyeram-v12-webp-metadata';
 const ASSETS=[
-  './styles.css?v=10',
-  './app.js?v=10',
-  './manifest.webmanifest?v=10',
+  './styles.css?v=12',
+  './app.js?v=12',
+  './manifest.webmanifest?v=12',
   './icons/icon-192.png?v=9',
   './icons/icon-512.png?v=9',
   './icons/icon-180.png?v=9'
