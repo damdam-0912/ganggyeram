@@ -1,4 +1,4 @@
-const CACHE='ganggyeram-v9-character-prompts';
+const CACHE='ganggyeram-v9-nai-autosort';
 const ASSETS=[
   './',
   './index.html',

@@ -82,10 +82,11 @@
         <label>종류<select id="entryType"><option>NovelAI</option><option>Stable Diffusion</option><option>Midjourney</option><option>영상</option><option>기타</option></select></label>
         <label>폴더<select id="entryFolder"></select></label>
       </div>
-      <label>프롬프트<textarea id="entryPrompt" rows="8" placeholder="프롬프트를 입력하세요"></textarea></label>
-      <label>캐릭터 1<textarea id="entryCharacter1" rows="6" placeholder="캐릭터 1 프롬프트"></textarea></label>
-      <label id="character2Label">캐릭터 2<textarea id="entryCharacter2" rows="6" placeholder="캐릭터 2 프롬프트"></textarea></label>
-      <label>네거티브 / 메모<textarea id="entryNegative" rows="4" placeholder="네거티브 프롬프트나 메모"></textarea></label>
+      <label>작가 태그<textarea id="entryArtistTags" rows="3" placeholder="artist: 태그가 자동으로 분리됩니다"></textarea></label>
+      <label>프롬프트<textarea id="entryPrompt" rows="8" placeholder="캐릭터, 외형, 구도, 표정, 배경 등의 프롬프트"></textarea></label>
+      <label>캐릭터 프롬프트<textarea id="entryCharacterPrompt" rows="5" placeholder="NovelAI char_captions가 있으면 자동으로 들어옵니다"></textarea></label>
+      <label>네거티브 프롬프트<textarea id="entryNegative" rows="4" placeholder="NovelAI UC / 네거티브 프롬프트"></textarea></label>
+      <label>메모<textarea id="entryMemo" rows="3" placeholder="개인 메모"></textarea></label>
       <label>태그<input id="entryTags" placeholder="쉼표로 구분: 남캐, 교복, 봄" /></label>
       <label class="image-picker-label">이미지
         <input id="entryImages" type="file" accept="image/*" multiple />
