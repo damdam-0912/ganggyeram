@@ -146,11 +146,128 @@ function normalizeNovelAIMetadata(chunks){
   const looksNovel=/novelai/i.test(software+' '+source+' '+descText)||Object.keys(merged).some(k=>['uc','sampler','noise_schedule','sm','sm_dyn','dynamic_thresholding'].includes(k));
   return (looksNovel||meta.prompt||meta.seed)?meta:null
 }
+
+async function loadImageForStealth(file){
+  return await new Promise((resolve,reject)=>{
+    const url=URL.createObjectURL(file);
+    const img=new Image();
+    img.onload=()=>{URL.revokeObjectURL(url);resolve(img)};
+    img.onerror=e=>{URL.revokeObjectURL(url);reject(e)};
+    img.src=url;
+  });
+}
+function bitsToBytes(bits){
+  const n=Math.floor(bits.length/8), out=new Uint8Array(n);
+  for(let i=0;i<n;i++)out[i]=parseInt(bits.slice(i*8,i*8+8),2);
+  return out;
+}
+async function inflateStealth(bytes){
+  for(const format of ['deflate','deflate-raw']){
+    try{
+      const ds=new DecompressionStream(format);
+      const ab=await new Response(new Blob([bytes]).stream().pipeThrough(ds)).arrayBuffer();
+      return new Uint8Array(ab);
+    }catch{}
+  }
+  return null;
+}
+async function readStealthMetadata(file){
+  if(!file)return null;
+  const img=await loadImageForStealth(file);
+  const canvas=document.createElement('canvas');
+  canvas.width=img.naturalWidth||img.width; canvas.height=img.naturalHeight||img.height;
+  const ctx=canvas.getContext('2d',{willReadFrequently:true});
+  ctx.drawImage(img,0,0);
+  const width=canvas.width,height=canvas.height,data=ctx.getImageData(0,0,width,height).data;
+
+  let hasAlpha=false;
+  for(let i=3;i<data.length;i+=4){if(data[i]<255){hasAlpha=true;break}}
+
+  let mode=null,compressed=false,bufferA='',bufferRGB='',indexA=0,indexRGB=0;
+  let confirming=true,readingLen=false,readingParam=false,paramLen=0,binaryData='';
+
+  outer: for(let x=0;x<width;x++){
+    for(let y=0;y<height;y++){
+      const i=(y*width+x)*4, r=data[i],g=data[i+1],b=data[i+2],a=data[i+3];
+      if(hasAlpha){bufferA+=(a&1);indexA++}
+      bufferRGB+=(r&1);bufferRGB+=(g&1);bufferRGB+=(b&1);indexRGB+=3;
+
+      if(confirming){
+        if(hasAlpha && indexA===15*8){
+          const sig=new TextDecoder().decode(bitsToBytes(bufferA));
+          if(sig==='stealth_pnginfo'||sig==='stealth_pngcomp'){
+            confirming=false;readingLen=true;mode='alpha';compressed=sig==='stealth_pngcomp';
+            bufferA='';indexA=0;
+          }else{
+            /* Alpha signature failed; RGB may still contain metadata. */
+            bufferA='';indexA=-1000000000;
+          }
+        }
+        if(confirming && indexRGB>=15*8){
+          const sig=new TextDecoder().decode(bitsToBytes(bufferRGB.slice(0,15*8)));
+          if(sig==='stealth_rgbinfo'||sig==='stealth_rgbcomp'){
+            confirming=false;readingLen=true;mode='rgb';compressed=sig==='stealth_rgbcomp';
+            bufferRGB=bufferRGB.slice(15*8);indexRGB=bufferRGB.length;
+          }else if(indexRGB>=15*8+2){break outer}
+        }
+      }else if(readingLen){
+        if(mode==='alpha'&&indexA===32){
+          paramLen=parseInt(bufferA,2);readingLen=false;readingParam=true;bufferA='';indexA=0;
+        }else if(mode==='rgb'&&indexRGB>=32){
+          paramLen=parseInt(bufferRGB.slice(0,32),2);
+          bufferRGB=bufferRGB.slice(32);indexRGB=bufferRGB.length;readingLen=false;readingParam=true;
+        }
+      }else if(readingParam){
+        if(mode==='alpha'&&indexA>=paramLen){binaryData=bufferA.slice(0,paramLen);break outer}
+        if(mode==='rgb'&&indexRGB>=paramLen){binaryData=bufferRGB.slice(0,paramLen);break outer}
+      }
+    }
+  }
+  if(!binaryData)return null;
+  let bytes=bitsToBytes(binaryData);
+  if(compressed){const dec=await inflateStealth(bytes);if(!dec)return null;bytes=dec}
+  const text=new TextDecoder('utf-8').decode(bytes);
+  return text||null;
+}
+function normalizeStealthNovelAI(text){
+  if(!text)return null;
+  let outer=tryJson(text);
+  if(!outer)return normalizeNovelAIMetadata({Comment:text});
+  /* Common NovelAI stealth wrapper stores the normal Comment JSON as a string. */
+  if(typeof outer.Comment==='string'){
+    const meta=normalizeNovelAIMetadata({
+      Comment:outer.Comment,
+      Description:outer.Description||'',
+      Software:outer.Software||'NovelAI',
+      Source:outer.Source||''
+    });
+    if(meta){meta.stealth=true;return meta}
+  }
+  const meta=normalizeNovelAIMetadata({
+    Comment:JSON.stringify(outer),
+    Description:outer.Description||outer.description||'',
+    Software:outer.Software||outer.software||'NovelAI',
+    Source:outer.Source||outer.source||''
+  });
+  if(meta){meta.stealth=true;return meta}
+  return null;
+}
+
 async function extractNovelAIMetadata(file){
   try{
     const name=(file?.name||'').toLowerCase();
-    if(file?.type==='image/png'||name.endsWith('.png'))return normalizeNovelAIMetadata(await readPngTextChunks(file));
-    if(file?.type==='image/jpeg'||/\.(jpe?g)$/i.test(name))return normalizeNovelAIMetadata(await readJpegExif(file));
+    if(file?.type==='image/png'||name.endsWith('.png')){
+      const normal=normalizeNovelAIMetadata(await readPngTextChunks(file));
+      if(normal)return normal;
+      const stealth=await readStealthMetadata(file);
+      return normalizeStealthNovelAI(stealth);
+    }
+    if(file?.type==='image/jpeg'||/\.(jpe?g)$/i.test(name)){
+      const exif=normalizeNovelAIMetadata(await readJpegExif(file));
+      if(exif)return exif;
+      /* Some browsers/files may carry a decodable lossless source despite an odd extension. */
+      try{return normalizeStealthNovelAI(await readStealthMetadata(file))}catch{return null}
+    }
     return null;
   }catch(e){console.warn('NovelAI metadata extract failed',e);return null}
 }
@@ -175,7 +292,7 @@ async function importBackup(file){try{const data=JSON.parse(await file.text());i
 async function seed(){const f1={id:uid(),name:'캐릭터',parentId:null},f2={id:uid(),name:'학교',parentId:f1.id};state.folders.push(f1,f2);state.entries.push({id:uid(),title:'봄 교실 미소',type:'NovelAI',folderId:f2.id,prompt:'boy, solo, male focus, black hair, short hair, school uniform, classroom, spring, gentle smile',negative:'low quality, bad hands',tags:['남캐','교복','봄'],images:[],favorite:true,trashed:false,createdAt:new Date().toISOString(),updatedAt:new Date().toISOString()});await saveState();renderAll();toast('예시 데이터를 추가했어요')}
 function closeDialogs(){/* no-op */}
 $$('.close-dialog').forEach(b=>b.onclick=()=>b.closest('dialog').close());
-$('#entryForm').addEventListener('submit',submitEntry);$('#folderForm').addEventListener('submit',submitFolder);$('#entryImages').addEventListener('change',async e=>{const files=[...e.target.files];workingImages.push(...await filesToDataUrls(files));renderImagePreview();for(const f of files){const meta=await extractNovelAIMetadata(f);if(!meta)continue;renderNovelAIMeta(meta);if(meta.prompt&&!$('#entryPrompt').value.trim())$('#entryPrompt').value=meta.prompt;if(meta.negative&&!$('#entryNegative').value.trim())$('#entryNegative').value=meta.negative;if(!$('#entryTitle').value.trim())$('#entryTitle').value=(f.name||'NovelAI 이미지').replace(/\.[^.]+$/,'');$('#entryType').value='NovelAI';toast('NovelAI 메타데이터를 불러왔어요');break}});
+$('#entryForm').addEventListener('submit',submitEntry);$('#folderForm').addEventListener('submit',submitFolder);$('#entryImages').addEventListener('change',async e=>{const files=[...e.target.files];workingImages.push(...await filesToDataUrls(files));renderImagePreview();for(const f of files){const meta=await extractNovelAIMetadata(f);if(!meta)continue;renderNovelAIMeta(meta);if(meta.prompt&&!$('#entryPrompt').value.trim())$('#entryPrompt').value=meta.prompt;if(meta.negative&&!$('#entryNegative').value.trim())$('#entryNegative').value=meta.negative;if(!$('#entryTitle').value.trim())$('#entryTitle').value=(f.name||'NovelAI 이미지').replace(/\.[^.]+$/,'');$('#entryType').value='NovelAI';toast(meta.stealth?'NovelAI Stealth 메타데이터를 불러왔어요':'NovelAI 메타데이터를 불러왔어요');break}});
 $('#addEntryBtn').onclick=()=>openEntryDialog();$('#fab').onclick=()=>openEntryDialog();$('#addFolderBtn').onclick=()=>openFolderDialog();
 $('#searchInput').oninput=e=>{view.query=e.target.value;renderEntries()};$('#clearSearchBtn').onclick=()=>{$('#searchInput').value='';view.query='';renderEntries()};
 $$('#filterTabs .chip').forEach(b=>b.onclick=()=>{$$('#filterTabs .chip').forEach(x=>x.classList.remove('active'));b.classList.add('active');view.filter=b.dataset.filter;renderTags();renderEntries()});
